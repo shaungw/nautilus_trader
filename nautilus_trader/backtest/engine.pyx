@@ -5349,6 +5349,15 @@ cdef class OrderMatchingEngine:
 
         # Immediately fill marketable order
         self.fill_market_order(order)
+        if (
+            order.is_open_c()
+            and self._liquidity_consumption
+            and self.book_type == BookType.L1_MBP
+        ):
+            # A partially observed L1 MARKET residual remains one native order
+            # and is reconsidered on subsequent market events. The matching
+            # core still owns its identity, state, fills, and final removal.
+            self._core.add_order(order)
 
     cdef Price _calculate_protection_price(self, OrderSide side):
         cdef double offset = self._price_protection_points * self.instrument.price_increment.as_double()
@@ -5889,7 +5898,7 @@ cdef class OrderMatchingEngine:
                 continue
 
             # Check expiry
-            if self._support_gtd_orders:
+            if self._support_gtd_orders and order.time_in_force == TimeInForce.GTD:
                 if order.expire_time_ns > 0 and timestamp_ns >= order.expire_time_ns:
                     self._core.delete_order(order)
                     self._cached_filled_qty.pop(order.client_order_id, None)
@@ -7234,7 +7243,9 @@ cdef class OrderMatchingEngine:
         existing position details.
 
         - If the `fills` list is empty, an error will be logged.
-        - Market orders will be rejected if no opposing orders are available to fulfill them.
+        - With L1 liquidity consumption enabled, MARKET-family orders consume
+          only evidenced top-of-book liquidity and remain open for fresh market
+          evidence when a residual cannot be observed.
 
         Parameters
         ----------
@@ -7409,7 +7420,20 @@ cdef class OrderMatchingEngine:
                 reduce_only_filled_raw += fill_qty._mem.raw
 
             if fill_qty._mem.raw == 0:
-                if len(fills) == 1 and order.status_c() == OrderStatus.SUBMITTED:
+                if (
+                    len(fills) == 1
+                    and order.status_c() == OrderStatus.SUBMITTED
+                    and not (
+                        self._liquidity_consumption
+                        and self.book_type == BookType.L1_MBP
+                        and (
+                            order.order_type == OrderType.MARKET
+                            or order.order_type == OrderType.MARKET_IF_TOUCHED
+                            or order.order_type == OrderType.STOP_MARKET
+                            or order.order_type == OrderType.TRAILING_STOP_MARKET
+                        )
+                    )
+                ):
                     self._generate_order_rejected(order, f"no market for {order.instrument_id}")
 
                 return  # Done
@@ -7444,56 +7468,59 @@ cdef class OrderMatchingEngine:
             or order.order_type == OrderType.TRAILING_STOP_MARKET
         )
         ):
-            # Exhausted simulated book volume (continue aggressive filling into next level)
-            # This is a very basic implementation of slipping by a single tick, in the future
-            # we will implement more detailed fill modeling.
-            if order.side == OrderSide.BUY:
-                fill_px = last_fill_px.add(self.instrument.price_increment)
-            elif order.side == OrderSide.SELL:
-                fill_px = last_fill_px.sub(self.instrument.price_increment)
-            else:
-                raise ValueError(  # pragma: no cover (design-time error)
-                    f"invalid `OrderSide`, was {order.side}",  # pragma: no cover (design-time error)
+            if not self._liquidity_consumption:
+                # Without consumption modeling, preserve the existing basic
+                # assumption that a MARKET-family order completes one tick into
+                # an unobserved next level. With consumption enabled, observed L1
+                # is the complete evidence and the same native order remains open
+                # for later market events.
+                if order.side == OrderSide.BUY:
+                    fill_px = last_fill_px.add(self.instrument.price_increment)
+                elif order.side == OrderSide.SELL:
+                    fill_px = last_fill_px.sub(self.instrument.price_increment)
+                else:
+                    raise ValueError(  # pragma: no cover (design-time error)
+                        f"invalid `OrderSide`, was {order.side}",  # pragma: no cover (design-time error)
+                    )
+
+                # Check protection price boundary for slip fills
+                if protection_price is not None:
+                    if order.side == OrderSide.BUY and fill_px._mem.raw > protection_price._mem.raw:
+                        return  # Slip fill would exceed protection boundary
+                    elif order.side == OrderSide.SELL and fill_px._mem.raw < protection_price._mem.raw:
+                        return  # Slip fill would exceed protection boundary
+
+                fill_qty = order.leaves_qty
+                if self._use_reduce_only and order.is_reduce_only:
+                    if reduce_only_remaining_raw == 0:
+                        return
+
+                    reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
+                    if fill_qty._mem.raw > reduce_only_remaining_raw:
+                        fill_qty = Quantity.from_raw_c(reduce_only_remaining_raw, self._size_prec)
+
+                    if reduce_only_exhausts_position:
+                        reduce_only_target_raw = reduce_only_filled_raw + fill_qty._mem.raw
+                        if reduce_only_target_raw < order.quantity._mem.raw:
+                            self._generate_order_updated(
+                                order=order,
+                                qty=Quantity.from_raw_c(reduce_only_target_raw, self._size_prec),
+                                price=None,
+                                trigger_price=None,
+                            )
+
+                    reduce_only_remaining_raw -= fill_qty._mem.raw
+                    reduce_only_filled_raw += fill_qty._mem.raw
+
+                self.fill_order(
+                    order=order,
+                    last_px=fill_px,
+                    last_qty=fill_qty,
+                    liquidity_side=order.liquidity_side,
+                    venue_position_id=venue_position_id,
+                    position=position,
                 )
-
-            # Check protection price boundary for slip fills
-            if protection_price is not None:
-                if order.side == OrderSide.BUY and fill_px._mem.raw > protection_price._mem.raw:
-                    return  # Slip fill would exceed protection boundary
-                elif order.side == OrderSide.SELL and fill_px._mem.raw < protection_price._mem.raw:
-                    return  # Slip fill would exceed protection boundary
-
-            fill_qty = order.leaves_qty
-            if self._use_reduce_only and order.is_reduce_only:
-                if reduce_only_remaining_raw == 0:
-                    return
-
-                reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
-                if fill_qty._mem.raw > reduce_only_remaining_raw:
-                    fill_qty = Quantity.from_raw_c(reduce_only_remaining_raw, self._size_prec)
-
-                if reduce_only_exhausts_position:
-                    reduce_only_target_raw = reduce_only_filled_raw + fill_qty._mem.raw
-                    if reduce_only_target_raw < order.quantity._mem.raw:
-                        self._generate_order_updated(
-                            order=order,
-                            qty=Quantity.from_raw_c(reduce_only_target_raw, self._size_prec),
-                            price=None,
-                            trigger_price=None,
-                        )
-
-                reduce_only_remaining_raw -= fill_qty._mem.raw
-                reduce_only_filled_raw += fill_qty._mem.raw
-
-            self.fill_order(
-                order=order,
-                last_px=fill_px,
-                last_qty=fill_qty,
-                liquidity_side=order.liquidity_side,
-                venue_position_id=venue_position_id,
-                position=position,
-            )
-            applied_fills.append((fill_px, fill_qty))
+                applied_fills.append((fill_px, fill_qty))
 
         # TODO: Refactor this section - nested conditionals for order types, top-of-book checks,
         # MAKER vs TAKER, liquidity consumption, spread leg generation, and queue cleanup are
@@ -7554,8 +7581,8 @@ cdef class OrderMatchingEngine:
                 # With liquidity consumption enabled, the displayed L1 slice is
                 # the only evidenced liquidity. Leave the residual LIMIT working
                 # until fresh market data arrives rather than inventing a deeper
-                # price level. MARKET-family orders retain their separate
-                # immediate residual handling above.
+                # price level. MARKET-family orders use the same evidenced-L1
+                # residual principle in their separate branch above.
                 if not self._liquidity_consumption:
                     # Exhausted simulated book volume (continue aggressive filling
                     # into an assumed next level when consumption modeling is off).

@@ -710,7 +710,7 @@ class TestOrderMatchingEngine:
 
         The residual remains on the same native order and fills only as fresh quote
         evidence replenishes the executable side. The generic one-tick residual
-        assumption remains reserved for MARKET-family orders.
+        assumption remains available only when consumption modeling is off.
         """
         matching_engine = OrderMatchingEngine(
             instrument=self.instrument,
@@ -791,6 +791,82 @@ class TestOrderMatchingEngine:
             self.instrument.make_qty(1.0),
             self.instrument.make_qty(1.0),
         ]
+
+    def test_l1_market_residual_waits_on_same_order_for_fresh_liquidity(self) -> None:
+        """
+        A GTC MARKET order consumes only displayed L1 when consumption is enabled.
+
+        Its unfilled residual remains on the same native order and reacts to
+        subsequent fresh quotes without an assumed next level or child order.
+        """
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=FillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+
+        initial = TestDataStubs.quote_tick(
+            instrument=self.instrument,
+            bid_price=100.00,
+            ask_price=100.10,
+            bid_size=10.0,
+            ask_size=1.0,
+            ts_event=1,
+            ts_init=1,
+        )
+        matching_engine.process_quote_tick(initial)
+
+        order = TestExecStubs.market_order(
+            instrument=self.instrument,
+            order_side=OrderSide.BUY,
+            quantity=self.instrument.make_qty(3.0),
+            time_in_force=TimeInForce.GTC,
+        )
+        TestExecStubs.make_accepted_order(order=order)
+        matching_engine.process_order(order, self.account_id)
+
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [self.instrument.make_qty(1.0)]
+        assert matching_engine.get_open_orders() == [order]
+
+        # No fresh data means no new observed liquidity and no synthetic fill.
+        matching_engine.iterate(timestamp_ns=2)
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [self.instrument.make_qty(1.0)]
+
+        for timestamp, ask_price in [(3, 100.08), (4, 100.06)]:
+            fresh = TestDataStubs.quote_tick(
+                instrument=self.instrument,
+                bid_price=100.00,
+                ask_price=ask_price,
+                bid_size=10.0,
+                ask_size=1.0,
+                ts_event=timestamp,
+                ts_init=timestamp,
+            )
+            matching_engine.process_quote_tick(fresh)
+
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [
+            self.instrument.make_qty(1.0),
+            self.instrument.make_qty(1.0),
+            self.instrument.make_qty(1.0),
+        ]
+        assert {fill.client_order_id for fill in fills} == {order.client_order_id}
+        assert matching_engine.get_open_orders() == []
 
     def test_fill_order_with_non_positive_qty_returns_early(self) -> None:
         # Arrange - Set initial bid/ask

@@ -295,7 +295,9 @@ cdef class MatchingCore:
         """
         Condition.not_none(order, "order")
 
-        if (
+        if order.order_type == OrderType.MARKET:
+            self._fill_market_order(order)
+        elif (
             order.order_type == OrderType.LIMIT
             or order.order_type == OrderType.MARKET_TO_LIMIT
         ):
@@ -481,7 +483,10 @@ cdef class MatchingCore:
 cdef inline int64_t order_sort_key(Order order):
     cdef Price trigger_price
     cdef Price price
-    if order.order_type == OrderType.LIMIT:
+    if order.order_type == OrderType.MARKET:
+        # Persistent L1 MARKET residuals retain priority over priced orders.
+        return 9223372036854775807 if order.side == OrderSide.BUY else -9223372036854775807
+    elif order.order_type == OrderType.LIMIT:
         price = order.price
         return price._mem.raw
     elif order.order_type == OrderType.MARKET_TO_LIMIT:
