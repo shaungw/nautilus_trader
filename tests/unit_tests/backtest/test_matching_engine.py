@@ -868,6 +868,83 @@ class TestOrderMatchingEngine:
         assert {fill.client_order_id for fill in fills} == {order.client_order_id}
         assert matching_engine.get_open_orders() == []
 
+    @pytest.mark.parametrize("order_type", ["LIMIT", "MARKET"])
+    @pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+    def test_l1_newer_same_value_quote_replenishes_observable_liquidity(
+        self,
+        order_type: str,
+        side: OrderSide,
+    ) -> None:
+        """A newer L1 QuoteTick is a new liquidity epoch independent of values."""
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=FillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+
+        def quote(timestamp: int):
+            return TestDataStubs.quote_tick(
+                instrument=self.instrument,
+                bid_price=100.00,
+                ask_price=100.10,
+                bid_size=1.0,
+                ask_size=1.0,
+                ts_event=timestamp,
+                ts_init=timestamp,
+            )
+
+        matching_engine.process_quote_tick(quote(1))
+        if order_type == "LIMIT":
+            order = TestExecStubs.limit_order(
+                instrument=self.instrument,
+                order_side=side,
+                price=Price.from_str("99.90" if side == OrderSide.SELL else "100.20"),
+                quantity=self.instrument.make_qty(2.0),
+                time_in_force=TimeInForce.GTC,
+            )
+        else:
+            order = TestExecStubs.market_order(
+                instrument=self.instrument,
+                order_side=side,
+                quantity=self.instrument.make_qty(2.0),
+                time_in_force=TimeInForce.GTC,
+            )
+            TestExecStubs.make_accepted_order(order=order)
+
+        matching_engine.process_order(order, self.account_id)
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [self.instrument.make_qty(1.0)]
+        assert matching_engine.get_open_orders() == [order]
+
+        # Reprocessing the same provider evidence cannot manufacture depth.
+        matching_engine.process_quote_tick(quote(1))
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [self.instrument.make_qty(1.0)]
+        assert matching_engine.get_open_orders() == [order]
+
+        # Identical values at a newer provider timestamp are fresh L1 evidence.
+        matching_engine.process_quote_tick(quote(2))
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [
+            self.instrument.make_qty(1.0),
+            self.instrument.make_qty(1.0),
+        ]
+        assert {fill.client_order_id for fill in fills} == {order.client_order_id}
+        assert matching_engine.get_open_orders() == []
+
     def test_fill_order_with_non_positive_qty_returns_early(self) -> None:
         # Arrange - Set initial bid/ask
         quote = TestDataStubs.quote_tick(

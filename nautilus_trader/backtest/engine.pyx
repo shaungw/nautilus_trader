@@ -4089,6 +4089,7 @@ cdef class OrderMatchingEngine:
         self._prev_ask_size_raw = 0
         self._last_quote_bid_raw = 0
         self._last_quote_ask_raw = 0
+        self._last_l1_quote_ts_event = 0
         self._has_quote_context = False
         self._tob_initialized = False
 
@@ -4141,6 +4142,7 @@ cdef class OrderMatchingEngine:
         self._prev_ask_size_raw = 0
         self._last_quote_bid_raw = 0
         self._last_quote_ask_raw = 0
+        self._last_l1_quote_ts_event = 0
         self._has_quote_context = False
         self._tob_initialized = False
 
@@ -4555,6 +4557,18 @@ cdef class OrderMatchingEngine:
                 )
                 self.iterate(tick.ts_init)
                 return
+
+            # Every strictly newer L1 quote is a fresh observable top-of-book
+            # liquidity epoch, even when its price and displayed size are
+            # unchanged. Reprocessing the same provider timestamp is not fresh
+            # evidence and must not replenish consumed liquidity.
+            if (
+                self._liquidity_consumption
+                and tick._mem.ts_event > self._last_l1_quote_ts_event
+            ):
+                self._bid_consumption.clear()
+                self._ask_consumption.clear()
+                self._last_l1_quote_ts_event = tick._mem.ts_event
 
             if self._queue_position:
                 self._decrement_l1_queue_on_quote(

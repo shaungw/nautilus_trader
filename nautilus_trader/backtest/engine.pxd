@@ -431,6 +431,7 @@ cdef class OrderMatchingEngine:
     cdef QuantityRaw _prev_ask_size_raw
     cdef PriceRaw _last_quote_bid_raw
     cdef PriceRaw _last_quote_ask_raw
+    cdef uint64_t _last_l1_quote_ts_event
     cdef bint _has_quote_context
     cdef bint _tob_initialized
 
