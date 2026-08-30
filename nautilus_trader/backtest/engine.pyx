@@ -5364,13 +5364,15 @@ cdef class OrderMatchingEngine:
         # Immediately fill marketable order
         self.fill_market_order(order)
         if (
-            order.is_open_c()
+            not order.is_closed_c()
             and self._liquidity_consumption
             and self.book_type == BookType.L1_MBP
         ):
-            # A partially observed L1 MARKET residual remains one native order
-            # and is reconsidered on subsequent market events. The matching
-            # core still owns its identity, state, fills, and final removal.
+            # An observable-L1 MARKET with any unfilled residual remains one
+            # native order and is reconsidered on subsequent market events.
+            # This includes a zero-size initial slice after the current quote
+            # epoch was already consumed by another order. The matching core
+            # still owns its identity, state, fills, and final removal.
             self._core.add_order(order)
 
     cdef Price _calculate_protection_price(self, OrderSide side):

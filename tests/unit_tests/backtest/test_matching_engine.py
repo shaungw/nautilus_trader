@@ -945,6 +945,92 @@ class TestOrderMatchingEngine:
         assert {fill.client_order_id for fill in fills} == {order.client_order_id}
         assert matching_engine.get_open_orders() == []
 
+    @pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
+    def test_l1_market_with_zero_initial_slice_waits_for_fresh_quote(
+        self,
+        side: OrderSide,
+    ) -> None:
+        """A MARKET submitted after this L1 epoch is exhausted remains native."""
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=FillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        messages: list[Any] = []
+
+        def handle(event) -> None:
+            messages.append(event)
+            order = self.cache.order(event.client_order_id)
+            if order is not None:
+                with contextlib.suppress(Exception):
+                    order.apply(event)
+
+        self.msgbus.register("ExecEngine.process", handle)
+
+        def quote(timestamp: int):
+            return TestDataStubs.quote_tick(
+                instrument=self.instrument,
+                bid_price=100.00,
+                ask_price=100.10,
+                bid_size=1.0,
+                ask_size=1.0,
+                ts_event=timestamp,
+                ts_init=timestamp,
+            )
+
+        matching_engine.process_quote_tick(quote(1))
+        consumer = TestExecStubs.market_order(
+            instrument=self.instrument,
+            order_side=side,
+            quantity=self.instrument.make_qty(1.0),
+            client_order_id=TestIdStubs.client_order_id(1),
+            time_in_force=TimeInForce.GTC,
+        )
+        self.cache.add_order(consumer, position_id=None)
+        matching_engine.process_order(consumer, self.account_id)
+
+        target = TestExecStubs.market_order(
+            instrument=self.instrument,
+            order_side=side,
+            quantity=self.instrument.make_qty(1.0),
+            client_order_id=TestIdStubs.client_order_id(2),
+            time_in_force=TimeInForce.GTC,
+        )
+        self.cache.add_order(target, position_id=None)
+        matching_engine.process_order(target, self.account_id)
+        # This low-level harness has no ExecutionEngine to apply submission and
+        # acceptance events. Apply them only after process_order so the test
+        # still proves registration of the genuine zero-initial-slice state.
+        TestExecStubs.make_accepted_order(order=target)
+        target_fills = [
+            message
+            for message in messages
+            if isinstance(message, OrderFilled)
+            and message.client_order_id == target.client_order_id
+        ]
+        assert target_fills == []
+
+        matching_engine.process_quote_tick(quote(2))
+        target_fills = [
+            message
+            for message in messages
+            if isinstance(message, OrderFilled)
+            and message.client_order_id == target.client_order_id
+        ]
+        assert [fill.last_qty for fill in target_fills] == [self.instrument.make_qty(1.0)]
+        assert target.is_closed
+
     def test_fill_order_with_non_positive_qty_returns_early(self) -> None:
         # Arrange - Set initial bid/ask
         quote = TestDataStubs.quote_tick(
