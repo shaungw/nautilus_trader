@@ -7551,46 +7551,51 @@ cdef class OrderMatchingEngine:
                     )
                     applied_fills.append((fill_px, fill_qty))
             else:  # Marketable limit order
-                # Exhausted simulated book volume (continue aggressive filling into next level)
-                # This is a very basic implementation of slipping by a single tick, in the future
-                # we will implement more detailed fill modeling.
-                if order.side == OrderSide.BUY:
-                    fill_px = last_fill_px.add(self.instrument.price_increment)
-                elif order.side == OrderSide.SELL:
-                    fill_px = last_fill_px.sub(self.instrument.price_increment)
-                else:
-                    raise ValueError(  # pragma: no cover (design-time error)
-                        f"invalid `OrderSide`, was {order.side}",  # pragma: no cover (design-time error)
+                # With liquidity consumption enabled, the displayed L1 slice is
+                # the only evidenced liquidity. Leave the residual LIMIT working
+                # until fresh market data arrives rather than inventing a deeper
+                # price level. MARKET-family orders retain their separate
+                # immediate residual handling above.
+                if not self._liquidity_consumption:
+                    # Exhausted simulated book volume (continue aggressive filling
+                    # into an assumed next level when consumption modeling is off).
+                    if order.side == OrderSide.BUY:
+                        fill_px = last_fill_px.add(self.instrument.price_increment)
+                    elif order.side == OrderSide.SELL:
+                        fill_px = last_fill_px.sub(self.instrument.price_increment)
+                    else:
+                        raise ValueError(  # pragma: no cover (design-time error)
+                            f"invalid `OrderSide`, was {order.side}",  # pragma: no cover (design-time error)
+                        )
+
+                    fill_qty = order.leaves_qty
+                    if self._use_reduce_only and order.is_reduce_only:
+                        if reduce_only_remaining_raw == 0:
+                            return
+
+                        reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
+                        if fill_qty._mem.raw > reduce_only_remaining_raw:
+                            fill_qty = Quantity.from_raw_c(reduce_only_remaining_raw, self._size_prec)
+
+                        if reduce_only_exhausts_position:
+                            reduce_only_target_raw = reduce_only_filled_raw + fill_qty._mem.raw
+                            if reduce_only_target_raw < order.quantity._mem.raw:
+                                self._generate_order_updated(
+                                    order=order,
+                                    qty=Quantity.from_raw_c(reduce_only_target_raw, self._size_prec),
+                                    price=None,
+                                    trigger_price=None,
+                                )
+
+                    self.fill_order(
+                        order=order,
+                        last_px=fill_px,
+                        last_qty=fill_qty,
+                        liquidity_side=order.liquidity_side,
+                        venue_position_id=venue_position_id,
+                        position=position,
                     )
-
-                fill_qty = order.leaves_qty
-                if self._use_reduce_only and order.is_reduce_only:
-                    if reduce_only_remaining_raw == 0:
-                        return
-
-                    reduce_only_exhausts_position = fill_qty._mem.raw >= reduce_only_remaining_raw
-                    if fill_qty._mem.raw > reduce_only_remaining_raw:
-                        fill_qty = Quantity.from_raw_c(reduce_only_remaining_raw, self._size_prec)
-
-                    if reduce_only_exhausts_position:
-                        reduce_only_target_raw = reduce_only_filled_raw + fill_qty._mem.raw
-                        if reduce_only_target_raw < order.quantity._mem.raw:
-                            self._generate_order_updated(
-                                order=order,
-                                qty=Quantity.from_raw_c(reduce_only_target_raw, self._size_prec),
-                                price=None,
-                                trigger_price=None,
-                            )
-
-                self.fill_order(
-                    order=order,
-                    last_px=fill_px,
-                    last_qty=fill_qty,
-                    liquidity_side=order.liquidity_side,
-                    venue_position_id=venue_position_id,
-                    position=position,
-                )
-                applied_fills.append((fill_px, fill_qty))
+                    applied_fills.append((fill_px, fill_qty))
 
         cdef Instrument instrument = self.cache.instrument(order.instrument_id)
         if instrument is None:

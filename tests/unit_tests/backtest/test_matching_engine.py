@@ -704,6 +704,94 @@ class TestOrderMatchingEngine:
             f"Expected fill of 30 (fresh liquidity), was {filled_events[0].last_qty}"
         )
 
+    def test_l1_marketable_limit_residual_waits_for_fresh_liquidity(self) -> None:
+        """
+        A marketable LIMIT may consume only displayed L1 when liquidity consumption is enabled.
+
+        The residual remains on the same native order and fills only as fresh quote
+        evidence replenishes the executable side. The generic one-tick residual
+        assumption remains reserved for MARKET-family orders.
+        """
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=FillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+
+        initial = TestDataStubs.quote_tick(
+            instrument=self.instrument,
+            bid_price=100.00,
+            ask_price=100.10,
+            bid_size=10.0,
+            ask_size=1.0,
+            ts_event=1,
+            ts_init=1,
+        )
+        matching_engine.process_quote_tick(initial)
+
+        order = TestExecStubs.limit_order(
+            instrument=self.instrument,
+            order_side=OrderSide.BUY,
+            price=Price.from_str("100.20"),
+            quantity=self.instrument.make_qty(3.0),
+            time_in_force=TimeInForce.GTC,
+        )
+        matching_engine.process_order(order, self.account_id)
+
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [self.instrument.make_qty(1.0)]
+
+        # Re-iterating without fresh market evidence cannot manufacture depth.
+        matching_engine.iterate(timestamp_ns=2)
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [self.instrument.make_qty(1.0)]
+
+        fresh_1 = TestDataStubs.quote_tick(
+            instrument=self.instrument,
+            bid_price=100.00,
+            ask_price=100.08,
+            bid_size=10.0,
+            ask_size=1.0,
+            ts_event=3,
+            ts_init=3,
+        )
+        matching_engine.process_quote_tick(fresh_1)
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [
+            self.instrument.make_qty(1.0),
+            self.instrument.make_qty(1.0),
+        ]
+
+        fresh_2 = TestDataStubs.quote_tick(
+            instrument=self.instrument,
+            bid_price=100.00,
+            ask_price=100.06,
+            bid_size=10.0,
+            ask_size=1.0,
+            ts_event=4,
+            ts_init=4,
+        )
+        matching_engine.process_quote_tick(fresh_2)
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [fill.last_qty for fill in fills] == [
+            self.instrument.make_qty(1.0),
+            self.instrument.make_qty(1.0),
+            self.instrument.make_qty(1.0),
+        ]
+
     def test_fill_order_with_non_positive_qty_returns_early(self) -> None:
         # Arrange - Set initial bid/ask
         quote = TestDataStubs.quote_tick(
