@@ -973,6 +973,7 @@ class TestOrderMatchingEngine:
         )
         TestExecStubs.make_submitted_order(order=order)
         matching_engine.process_order(order, self.account_id)
+        matching_engine.process_quote_tick(quote)
 
         fills = [message for message in messages if isinstance(message, OrderFilled)]
         assert [(fill.last_px, fill.last_qty) for fill in fills] == [

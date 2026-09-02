@@ -6335,9 +6335,9 @@ cdef class OrderMatchingEngine:
             and self._fill_model.assume_market_residual_depth(self.instrument, order)
         ):
             if order.side == OrderSide.BUY:
-                fill_px = self._core.ask.add(self.instrument.price_increment)
+                fill_px = (<Price>self._core.ask).add(self.instrument.price_increment)
             elif order.side == OrderSide.SELL:
-                fill_px = self._core.bid.sub(self.instrument.price_increment)
+                fill_px = (<Price>self._core.bid).sub(self.instrument.price_increment)
             else:
                 raise ValueError(  # pragma: no cover (design-time error)
                     f"invalid `OrderSide`, was {order.side}",  # pragma: no cover (design-time error)
