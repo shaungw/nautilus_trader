@@ -119,6 +119,29 @@ cdef class FillModel:
         """
         return self._event_success(self.prob_slippage)
 
+    cpdef bint assume_market_residual_depth(self, Instrument instrument, Order order):
+        """
+        Return whether native L1 matching may complete a MARKET residual one tick adverse.
+
+        This opt-in is evaluated per order after displayed or simulated L1
+        liquidity is exhausted. The default is strict: residual quantity stays
+        open for later evidence. Custom fill models may opt in without disabling
+        venue-wide liquidity consumption for LIMIT and other orders.
+
+        Parameters
+        ----------
+        instrument : Instrument
+            The instrument being traded.
+        order : Order
+            The open MARKET-family order with residual quantity.
+
+        Returns
+        -------
+        bool
+
+        """
+        return False
+
     cpdef OrderBook get_orderbook_for_fill_simulation(
         self,
         Instrument instrument,

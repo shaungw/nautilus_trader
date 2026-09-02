@@ -6316,6 +6316,41 @@ cdef class OrderMatchingEngine:
         if not is_trigger_price_fill:
             fills = self._apply_liquidity_consumption(fills, order.side, order.leaves_qty._mem.raw)
 
+        # A per-order residual-depth opt-in must also cover the zero-observed-
+        # slice case. Without this branch, an empty simulated book never enters
+        # ``apply_fills`` and its existing residual completion branch cannot run.
+        # The FillModel has already validated the current executable price before
+        # opting in; native matching still owns the single adverse-tick fill.
+        if (
+            not fills
+            and order.status_c() in (
+                OrderStatus.SUBMITTED,
+                OrderStatus.ACCEPTED,
+                OrderStatus.PARTIALLY_FILLED,
+            )
+            and order.leaves_qty._mem.raw > 0
+            and self.book_type == BookType.L1_MBP
+            and order.order_type == OrderType.MARKET
+            and self._fill_model is not None
+            and self._fill_model.assume_market_residual_depth(self.instrument, order)
+        ):
+            if order.side == OrderSide.BUY:
+                fill_px = (<Price>self._core.ask).add(self.instrument.price_increment)
+            elif order.side == OrderSide.SELL:
+                fill_px = (<Price>self._core.bid).sub(self.instrument.price_increment)
+            else:
+                raise ValueError(  # pragma: no cover (design-time error)
+                    f"invalid `OrderSide`, was {order.side}",  # pragma: no cover (design-time error)
+                )
+
+            if protection_price is not None:
+                if order.side == OrderSide.BUY and fill_px._mem.raw > protection_price._mem.raw:
+                    return
+                elif order.side == OrderSide.SELL and fill_px._mem.raw < protection_price._mem.raw:
+                    return
+
+            fills = [(fill_px, order.leaves_qty)]
+
         self.apply_fills(
             order=order,
             fills=fills,
@@ -6357,6 +6392,8 @@ cdef class OrderMatchingEngine:
             # If simulation produced no fills (e.g., custom model removed best levels),
             # fall back to standard market logic to preserve expected behavior.
             if not fills:
+                if self._fill_model.assume_market_residual_depth(self.instrument, order):
+                    return fills
                 return self.determine_market_price_and_volume(order)
 
             return fills
@@ -7484,12 +7521,26 @@ cdef class OrderMatchingEngine:
             or order.order_type == OrderType.TRAILING_STOP_MARKET
         )
         ):
-            if not self._liquidity_consumption:
+            if (
+                not self._liquidity_consumption
+                or (
+                    self._fill_model is not None
+                    and order.status_c() in (
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.ACCEPTED,
+                        OrderStatus.PARTIALLY_FILLED,
+                    )
+                    and order.leaves_qty._mem.raw > 0
+                    and self._fill_model.assume_market_residual_depth(self.instrument, order)
+                )
+            ):
                 # Without consumption modeling, preserve the existing basic
                 # assumption that a MARKET-family order completes one tick into
-                # an unobserved next level. With consumption enabled, observed L1
-                # is the complete evidence and the same native order remains open
-                # for later market events.
+                # an unobserved next level. A custom fill model may make the same
+                # native assumption for one specific order while venue-wide
+                # consumption remains enabled. Otherwise, observed L1 is the
+                # complete evidence and the same native order remains open for
+                # later market events.
                 if order.side == OrderSide.BUY:
                     fill_px = last_fill_px.add(self.instrument.price_increment)
                 elif order.side == OrderSide.SELL:

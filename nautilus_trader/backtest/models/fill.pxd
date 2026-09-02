@@ -31,6 +31,7 @@ cdef class FillModel:
     cpdef bint fill_limit_inside_spread(self)
     cpdef bint is_limit_filled(self)
     cpdef bint is_slipped(self)
+    cpdef bint assume_market_residual_depth(self, Instrument instrument, Order order)
     cpdef OrderBook get_orderbook_for_fill_simulation(
         self,
         Instrument instrument,

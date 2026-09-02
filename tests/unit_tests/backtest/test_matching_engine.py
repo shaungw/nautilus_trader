@@ -35,6 +35,7 @@ from nautilus_trader.model.data import BarType
 from nautilus_trader.model.data import BookOrder
 from nautilus_trader.model.data import OrderBookDelta
 from nautilus_trader.model.data import OrderBookDepth10
+from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import AggregationSource
 from nautilus_trader.model.enums import AggressorSide
@@ -46,6 +47,7 @@ from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import TrailingOffsetType
@@ -78,6 +80,27 @@ from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 
 _ETHUSDT_PERP_BINANCE = TestInstrumentProvider.ethusdt_perp_binance()
+
+
+class _NativeMarketResidualDepthFillModel(FillModel):
+    """Opt MARKET orders into native one-tick residual depth per order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.eligible_statuses = []
+
+    def assume_market_residual_depth(self, instrument, order) -> bool:
+        del instrument
+        self.eligible_statuses.append(order.status)
+        return True
+
+
+class _ZeroObservedMarketResidualDepthFillModel(_NativeMarketResidualDepthFillModel):
+    """Expose a valid native price but no remaining displayed depth."""
+
+    def get_orderbook_for_fill_simulation(self, instrument, order, best_bid, best_ask):
+        del order, best_bid, best_ask
+        return OrderBook(instrument_id=instrument.id, book_type=BookType.L2_MBP)
 
 
 class TestOrderMatchingEngine:
@@ -867,6 +890,163 @@ class TestOrderMatchingEngine:
         ]
         assert {fill.client_order_id for fill in fills} == {order.client_order_id}
         assert matching_engine.get_open_orders() == []
+
+    def test_l1_market_residual_can_opt_in_per_order_without_relaxing_venue(self) -> None:
+        """The fill-model hook enables native +1 tick residual with consumption still on."""
+
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=_NativeMarketResidualDepthFillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        matching_engine.process_quote_tick(
+            TestDataStubs.quote_tick(
+                instrument=self.instrument,
+                bid_price=100.00,
+                ask_price=100.10,
+                bid_size=10.0,
+                ask_size=2.0,
+                ts_event=1,
+                ts_init=1,
+            ),
+        )
+
+        order = TestExecStubs.market_order(
+            instrument=self.instrument,
+            order_side=OrderSide.BUY,
+            quantity=self.instrument.make_qty(5.0),
+            time_in_force=TimeInForce.GTC,
+        )
+        TestExecStubs.make_accepted_order(order=order)
+        matching_engine.process_order(order, self.account_id)
+
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [(fill.last_px, fill.last_qty) for fill in fills] == [
+            (Price.from_str("100.100"), self.instrument.make_qty(2.0)),
+            (Price.from_str("100.110"), self.instrument.make_qty(3.0)),
+        ]
+
+    def test_l1_market_residual_opt_in_fills_all_when_observed_slice_is_zero(self) -> None:
+        """A consumed shared tier cannot strand a tagged MARKET residual."""
+
+        fill_model = _ZeroObservedMarketResidualDepthFillModel()
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=fill_model,
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        quote = TestDataStubs.quote_tick(
+            instrument=self.instrument,
+            bid_price=100.00,
+            ask_price=100.10,
+            bid_size=10.0,
+            ask_size=2.0,
+            ts_event=1,
+            ts_init=1,
+        )
+        matching_engine.process_quote_tick(quote)
+
+        order = TestExecStubs.market_order(
+            instrument=self.instrument,
+            order_side=OrderSide.BUY,
+            quantity=self.instrument.make_qty(8.0),
+            time_in_force=TimeInForce.GTC,
+        )
+        TestExecStubs.make_accepted_order(order=order)
+        matching_engine.process_order(order, self.account_id)
+
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [(fill.last_px, fill.last_qty) for fill in fills] == [
+            (Price.from_str("100.110"), self.instrument.make_qty(8.0)),
+        ]
+        for fill in fills:
+            order.apply(fill)
+        assert order.leaves_qty == self.instrument.make_qty(0.0), (
+            order.status,
+            fill_model.eligible_statuses,
+        )
+        assert OrderStatus.ACCEPTED in fill_model.eligible_statuses
+
+        matching_engine.process_quote_tick(quote)
+        fills_after_repeat = [message for message in messages if isinstance(message, OrderFilled)]
+        assert fills_after_repeat == fills
+
+    @pytest.mark.parametrize(
+        "pending_event",
+        [TestEventStubs.order_pending_update, TestEventStubs.order_pending_cancel],
+    )
+    def test_l1_market_residual_opt_in_rejects_intermediate_states(self, pending_event) -> None:
+        """Pending mutation states are not executable residual-depth states."""
+
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=_ZeroObservedMarketResidualDepthFillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        matching_engine.process_quote_tick(
+            TestDataStubs.quote_tick(
+                instrument=self.instrument,
+                bid_price=100.00,
+                ask_price=100.10,
+                bid_size=10.0,
+                ask_size=2.0,
+                ts_event=1,
+                ts_init=1,
+            ),
+        )
+        order = TestExecStubs.market_order(
+            instrument=self.instrument,
+            order_side=OrderSide.BUY,
+            quantity=self.instrument.make_qty(8.0),
+            time_in_force=TimeInForce.GTC,
+        )
+        TestExecStubs.make_accepted_order(order=order)
+        order.apply(pending_event(order))
+        pending_status = order.status
+
+        matching_engine.fill_market_order(order)
+
+        filled = [message for message in messages if isinstance(message, OrderFilled)]
+        assert filled == [], (pending_status, order.status, filled)
+        assert order.leaves_qty == self.instrument.make_qty(8.0)
 
     @pytest.mark.parametrize("order_type", ["LIMIT", "MARKET"])
     @pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
