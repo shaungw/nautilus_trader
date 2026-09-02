@@ -6357,6 +6357,8 @@ cdef class OrderMatchingEngine:
             # If simulation produced no fills (e.g., custom model removed best levels),
             # fall back to standard market logic to preserve expected behavior.
             if not fills:
+                if self._fill_model.assume_market_residual_depth(self.instrument, order):
+                    return fills
                 return self.determine_market_price_and_volume(order)
 
             return fills
@@ -7484,12 +7486,20 @@ cdef class OrderMatchingEngine:
             or order.order_type == OrderType.TRAILING_STOP_MARKET
         )
         ):
-            if not self._liquidity_consumption:
+            if (
+                not self._liquidity_consumption
+                or (
+                    self._fill_model is not None
+                    and self._fill_model.assume_market_residual_depth(self.instrument, order)
+                )
+            ):
                 # Without consumption modeling, preserve the existing basic
                 # assumption that a MARKET-family order completes one tick into
-                # an unobserved next level. With consumption enabled, observed L1
-                # is the complete evidence and the same native order remains open
-                # for later market events.
+                # an unobserved next level. A custom fill model may make the same
+                # native assumption for one specific order while venue-wide
+                # consumption remains enabled. Otherwise, observed L1 is the
+                # complete evidence and the same native order remains open for
+                # later market events.
                 if order.side == OrderSide.BUY:
                     fill_px = last_fill_px.add(self.instrument.price_increment)
                 elif order.side == OrderSide.SELL:

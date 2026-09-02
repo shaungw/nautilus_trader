@@ -80,6 +80,14 @@ from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 _ETHUSDT_PERP_BINANCE = TestInstrumentProvider.ethusdt_perp_binance()
 
 
+class _NativeMarketResidualDepthFillModel(FillModel):
+    """Opt MARKET orders into native one-tick residual depth per order."""
+
+    def assume_market_residual_depth(self, instrument, order) -> bool:
+        del instrument, order
+        return True
+
+
 class TestOrderMatchingEngine:
     def setup(self):
         # Fixture Setup
@@ -867,6 +875,54 @@ class TestOrderMatchingEngine:
         ]
         assert {fill.client_order_id for fill in fills} == {order.client_order_id}
         assert matching_engine.get_open_orders() == []
+
+    def test_l1_market_residual_can_opt_in_per_order_without_relaxing_venue(self) -> None:
+        """The fill-model hook enables native +1 tick residual with consumption still on."""
+
+        matching_engine = OrderMatchingEngine(
+            instrument=self.instrument,
+            raw_id=0,
+            fill_model=_NativeMarketResidualDepthFillModel(),
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        matching_engine.process_quote_tick(
+            TestDataStubs.quote_tick(
+                instrument=self.instrument,
+                bid_price=100.00,
+                ask_price=100.10,
+                bid_size=10.0,
+                ask_size=1.0,
+                ts_event=1,
+                ts_init=1,
+            ),
+        )
+
+        order = TestExecStubs.market_order(
+            instrument=self.instrument,
+            order_side=OrderSide.BUY,
+            quantity=self.instrument.make_qty(3.0),
+            time_in_force=TimeInForce.GTC,
+        )
+        TestExecStubs.make_accepted_order(order=order)
+        matching_engine.process_order(order, self.account_id)
+
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert [(fill.last_px, fill.last_qty) for fill in fills] == [
+            (Price.from_str("100.100"), self.instrument.make_qty(1.0)),
+            (Price.from_str("100.110"), self.instrument.make_qty(2.0)),
+        ]
 
     @pytest.mark.parametrize("order_type", ["LIMIT", "MARKET"])
     @pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])
