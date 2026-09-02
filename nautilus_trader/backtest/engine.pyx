@@ -6316,6 +6316,36 @@ cdef class OrderMatchingEngine:
         if not is_trigger_price_fill:
             fills = self._apply_liquidity_consumption(fills, order.side, order.leaves_qty._mem.raw)
 
+        # A per-order residual-depth opt-in must also cover the zero-observed-
+        # slice case. Without this branch, an empty simulated book never enters
+        # ``apply_fills`` and its existing residual completion branch cannot run.
+        # The FillModel has already validated the current executable price before
+        # opting in; native matching still owns the single adverse-tick fill.
+        if (
+            not fills
+            and order.is_open_c()
+            and self.book_type == BookType.L1_MBP
+            and order.order_type == OrderType.MARKET
+            and self._fill_model is not None
+            and self._fill_model.assume_market_residual_depth(self.instrument, order)
+        ):
+            if order.side == OrderSide.BUY:
+                fill_px = self._core.ask.add(self.instrument.price_increment)
+            elif order.side == OrderSide.SELL:
+                fill_px = self._core.bid.sub(self.instrument.price_increment)
+            else:
+                raise ValueError(  # pragma: no cover (design-time error)
+                    f"invalid `OrderSide`, was {order.side}",  # pragma: no cover (design-time error)
+                )
+
+            if protection_price is not None:
+                if order.side == OrderSide.BUY and fill_px._mem.raw > protection_price._mem.raw:
+                    return
+                elif order.side == OrderSide.SELL and fill_px._mem.raw < protection_price._mem.raw:
+                    return
+
+            fills = [(fill_px, order.leaves_qty)]
+
         self.apply_fills(
             order=order,
             fills=fills,
