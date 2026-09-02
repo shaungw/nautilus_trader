@@ -971,7 +971,7 @@ class TestOrderMatchingEngine:
             quantity=self.instrument.make_qty(8.0),
             time_in_force=TimeInForce.GTC,
         )
-        TestExecStubs.make_accepted_order(order=order)
+        TestExecStubs.make_submitted_order(order=order)
         matching_engine.process_order(order, self.account_id)
 
         fills = [message for message in messages if isinstance(message, OrderFilled)]

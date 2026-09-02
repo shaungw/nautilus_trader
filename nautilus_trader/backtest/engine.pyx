@@ -6323,7 +6323,12 @@ cdef class OrderMatchingEngine:
         # opting in; native matching still owns the single adverse-tick fill.
         if (
             not fills
-            and not order.is_closed_c()
+            and order.status_c() in (
+                OrderStatus.SUBMITTED,
+                OrderStatus.ACCEPTED,
+                OrderStatus.PARTIALLY_FILLED,
+            )
+            and order.leaves_qty._mem.raw > 0
             and self.book_type == BookType.L1_MBP
             and order.order_type == OrderType.MARKET
             and self._fill_model is not None
