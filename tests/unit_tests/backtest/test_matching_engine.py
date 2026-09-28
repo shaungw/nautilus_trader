@@ -103,6 +103,17 @@ class _ZeroObservedMarketResidualDepthFillModel(_NativeMarketResidualDepthFillMo
         return OrderBook(instrument_id=instrument.id, book_type=BookType.L2_MBP)
 
 
+class _EvidenceVetoFillModel(FillModel):
+    def __init__(self):
+        super().__init__()
+        self.veto = True
+
+    def get_orderbook_for_fill_simulation(self, instrument, order, best_bid, best_ask):
+        if self.veto:
+            return OrderBook(instrument_id=instrument.id, book_type=BookType.L2_MBP)
+        return None
+
+
 class TestOrderMatchingEngine:
     def setup(self):
         # Fixture Setup
@@ -890,6 +901,45 @@ class TestOrderMatchingEngine:
         ]
         assert {fill.client_order_id for fill in fills} == {order.client_order_id}
         assert matching_engine.get_open_orders() == []
+
+    def test_market_explicit_empty_book_veto_preserves_same_residual_order(self):
+        model = _EvidenceVetoFillModel()
+        engine = OrderMatchingEngine(
+            instrument=self.instrument, raw_id=0, fill_model=model,
+            fee_model=MakerTakerFeeModel(), book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+            reject_stop_orders=True, trade_execution=False, liquidity_consumption=True,
+            msgbus=self.msgbus, cache=self.cache, clock=self.clock,
+        )
+        messages = []
+        self.msgbus.register('ExecEngine.process', messages.append)
+        def quote(ts):
+            return TestDataStubs.quote_tick(instrument=self.instrument,
+                bid_price=100.00, ask_price=100.10, bid_size=10., ask_size=1.,
+                ts_event=ts, ts_init=ts)
+        engine.process_quote_tick(quote(1))
+        order = TestExecStubs.market_order(instrument=self.instrument,
+            order_side=OrderSide.BUY, quantity=self.instrument.make_qty(3.),
+            time_in_force=TimeInForce.GTC)
+        TestExecStubs.make_accepted_order(order=order)
+        engine.process_order(order, self.account_id)
+        engine.iterate(timestamp_ns=2)
+        assert not [m for m in messages if isinstance(m, OrderFilled)]
+        assert engine.get_open_orders() == [order]
+        model.veto = False
+        engine.process_quote_tick(quote(3))
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert [f.last_qty for f in fills] == [self.instrument.make_qty(1.)]
+        model.veto = True
+        engine.process_quote_tick(quote(4))
+        assert len([m for m in messages if isinstance(m, OrderFilled)]) == 1
+        assert engine.get_open_orders() == [order]
+        model.veto = False
+        engine.process_quote_tick(quote(5)); engine.process_quote_tick(quote(6))
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert [f.last_qty for f in fills] == [self.instrument.make_qty(1.)]*3
+        assert {f.client_order_id for f in fills} == {order.client_order_id}
+        assert not engine.get_open_orders()
 
     def test_l1_market_residual_can_opt_in_per_order_without_relaxing_venue(self) -> None:
         """The fill-model hook enables native +1 tick residual with consumption still on."""
