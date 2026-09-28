@@ -6374,7 +6374,8 @@ cdef class OrderMatchingEngine:
         # Get current best bid/ask for simulation
         cdef Price best_bid = self._core.bid
         cdef Price best_ask = self._core.ask
-        if best_bid is None or best_ask is None:
+        if ((order.side == OrderSide.BUY and best_ask is None)
+                or (order.side == OrderSide.SELL and best_bid is None)):
             return []  # No market available
 
         # Try to get simulated OrderBook from FillModel

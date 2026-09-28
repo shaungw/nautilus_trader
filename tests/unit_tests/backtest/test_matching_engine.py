@@ -941,6 +941,31 @@ class TestOrderMatchingEngine:
         assert {f.client_order_id for f in fills} == {order.client_order_id}
         assert not engine.get_open_orders()
 
+    def test_market_buy_needs_only_current_ask_side(self):
+        model = _EvidenceVetoFillModel()
+        model.veto = False
+        engine = OrderMatchingEngine(
+            instrument=self.instrument, raw_id=0, fill_model=model,
+            fee_model=MakerTakerFeeModel(), book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+            reject_stop_orders=True, trade_execution=False, liquidity_consumption=True,
+            msgbus=self.msgbus, cache=self.cache, clock=self.clock,
+        )
+        messages = []
+        self.msgbus.register('ExecEngine.process', messages.append)
+        quote = TestDataStubs.quote_tick(instrument=self.instrument,
+            bid_price=0.0, ask_price=100.10, bid_size=0., ask_size=1.,
+            ts_event=1, ts_init=1)
+        engine.process_quote_tick(quote)
+        order = TestExecStubs.market_order(instrument=self.instrument,
+            order_side=OrderSide.BUY, quantity=self.instrument.make_qty(1.),
+            time_in_force=TimeInForce.GTC)
+        TestExecStubs.make_accepted_order(order=order)
+        engine.process_order(order, self.account_id)
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert len(fills) == 1
+        assert fills[0].last_px == self.instrument.make_price(100.10)
+
     def test_l1_market_residual_can_opt_in_per_order_without_relaxing_venue(self) -> None:
         """The fill-model hook enables native +1 tick residual with consumption still on."""
 
