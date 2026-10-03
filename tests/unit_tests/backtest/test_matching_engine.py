@@ -56,6 +56,7 @@ from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderModifyRejected
 from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.events import OrderUpdated
+from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
@@ -78,6 +79,27 @@ from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 
 _ETHUSDT_PERP_BINANCE = TestInstrumentProvider.ethusdt_perp_binance()
+
+
+class _ExplicitMarketBookFillModel(FillModel):
+    """A simulated book's zero depth is an explicit veto, never a fallback."""
+
+    def __init__(self):
+        super().__init__()
+        self.available = 0
+        self.use_default_book = False
+
+    def get_orderbook_for_fill_simulation(self, instrument, order, best_bid, best_ask):
+        if self.use_default_book:
+            return None
+        book = OrderBook(instrument_id=instrument.id, book_type=BookType.L2_MBP)
+        if self.available:
+            book.add(
+                BookOrder(side=OrderSide.SELL, price=best_ask,
+                          size=instrument.make_qty(self.available), order_id=1),
+                0, 0,
+            )
+        return book
 
 
 class TestOrderMatchingEngine:
@@ -867,6 +889,80 @@ class TestOrderMatchingEngine:
         ]
         assert {fill.client_order_id for fill in fills} == {order.client_order_id}
         assert matching_engine.get_open_orders() == []
+
+    def test_market_explicit_book_veto_cannot_fall_back_after_carrier_update(self):
+        model = _ExplicitMarketBookFillModel()
+        engine = OrderMatchingEngine(
+            instrument=self.instrument, raw_id=0, fill_model=model,
+            fee_model=MakerTakerFeeModel(), book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+            reject_stop_orders=True, trade_execution=False, liquidity_consumption=True,
+            msgbus=self.msgbus, cache=self.cache, clock=self.clock,
+        )
+        messages = []
+        def record(message):
+            messages.append(message)
+            if isinstance(message, OrderFilled):
+                model.available -= int(message.last_qty)
+        self.msgbus.register("ExecEngine.process", record)
+        def quote(ts, bid=100.00):
+            return TestDataStubs.quote_tick(instrument=self.instrument,
+                bid_price=bid, ask_price=100.10, bid_size=57., ask_size=15.,
+                ts_event=ts, ts_init=ts)
+        engine.process_quote_tick(quote(1))
+        order = TestExecStubs.market_order(instrument=self.instrument,
+            order_side=OrderSide.BUY, quantity=self.instrument.make_qty(30.),
+            time_in_force=TimeInForce.GTC)
+        TestExecStubs.make_accepted_order(order=order)
+        model.available = 15
+        engine.process_order(order, self.account_id)
+        assert [m.last_qty for m in messages if isinstance(m, OrderFilled)] == [
+            self.instrument.make_qty(15.)]
+        assert model.available == 0
+        assert engine.get_open_orders() == [order]
+        # The new carrier timestamp may not override the explicit model veto.
+        engine.process_quote_tick(quote(2, bid=100.01))
+        assert [m.last_qty for m in messages if isinstance(m, OrderFilled)] == [
+            self.instrument.make_qty(15.)]
+        assert engine.get_open_orders() == [order]
+        # Newly supported depth works once and preserves the same residual order.
+        model.available = 7
+        engine.process_quote_tick(quote(3))
+        assert [m.last_qty for m in messages if isinstance(m, OrderFilled)] == [
+            self.instrument.make_qty(15.), self.instrument.make_qty(7.)]
+        engine.process_quote_tick(quote(4))
+        assert len([m for m in messages if isinstance(m, OrderFilled)]) == 2
+        model.available = 8
+        engine.process_quote_tick(quote(5))
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert [m.last_qty for m in fills] == [self.instrument.make_qty(q) for q in [15, 7, 8]]
+        assert {m.client_order_id for m in fills} == {order.client_order_id}
+        assert engine.get_open_orders() == []
+
+    def test_market_none_book_retains_normal_supported_matching(self):
+        model = _ExplicitMarketBookFillModel()
+        model.use_default_book = True
+        engine = OrderMatchingEngine(
+            instrument=self.instrument, raw_id=0, fill_model=model,
+            fee_model=MakerTakerFeeModel(), book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING, account_type=AccountType.MARGIN,
+            reject_stop_orders=True, trade_execution=False, liquidity_consumption=True,
+            msgbus=self.msgbus, cache=self.cache, clock=self.clock,
+        )
+        messages = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        engine.process_quote_tick(TestDataStubs.quote_tick(instrument=self.instrument,
+            bid_price=100.00, ask_price=100.10, bid_size=10., ask_size=15.,
+            ts_event=1, ts_init=1))
+        order = TestExecStubs.market_order(instrument=self.instrument,
+            order_side=OrderSide.BUY, quantity=self.instrument.make_qty(15.),
+            time_in_force=TimeInForce.GTC)
+        TestExecStubs.make_accepted_order(order=order)
+        engine.process_order(order, self.account_id)
+        fills = [m for m in messages if isinstance(m, OrderFilled)]
+        assert len(fills) == 1
+        assert fills[0].last_qty == self.instrument.make_qty(15.)
+        assert fills[0].last_px == self.instrument.make_price(100.10)
 
     @pytest.mark.parametrize("order_type", ["LIMIT", "MARKET"])
     @pytest.mark.parametrize("side", [OrderSide.BUY, OrderSide.SELL])

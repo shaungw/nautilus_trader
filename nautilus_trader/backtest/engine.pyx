@@ -6354,11 +6354,8 @@ cdef class OrderMatchingEngine:
                 size_prec=self._size_prec,
                 is_aggressive=True,
             )
-            # If simulation produced no fills (e.g., custom model removed best levels),
-            # fall back to standard market logic to preserve expected behavior.
-            if not fills:
-                return self.determine_market_price_and_volume(order)
-
+            # An explicit simulated book is authoritative, including an empty
+            # evidence/liquidity veto. Only None requests the default book.
             return fills
         else:
             # Fall back to standard logic
