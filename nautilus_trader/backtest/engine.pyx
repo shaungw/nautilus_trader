@@ -7308,6 +7308,7 @@ cdef class OrderMatchingEngine:
         cdef:
             bint initial_market_to_limit_fill = False
             Price last_fill_px = None
+            Instrument spread_instrument = self.cache.instrument(order.instrument_id)
             Quantity cached_reduce_only_filled
             QuantityRaw reduce_only_remaining_raw = 0
             QuantityRaw reduce_only_filled_raw = 0
@@ -7552,6 +7553,13 @@ cdef class OrderMatchingEngine:
         )
         ):
             if not self._has_targets and ((order.side == OrderSide.BUY and order.price == self._core.ask) or (order.side == OrderSide.SELL and order.price == self._core.bid)):
+                # A custom fill model may explicitly allow a LIMIT at the
+                # displayed touch to take observed liquidity.  When that
+                # slice is partial the residual remains open, but every
+                # applied carrier slice must still expand to its financial
+                # legs before returning for later market evidence.
+                if applied_fills and spread_instrument is not None and spread_instrument.is_spread():
+                    self._generate_spread_leg_fills(order, applied_fills, liquidity_side)
                 return  # Limit price is equal to top-of-book, no further fills
 
             if order.liquidity_side == LiquiditySide.MAKER:
@@ -7637,12 +7645,11 @@ cdef class OrderMatchingEngine:
                     )
                     applied_fills.append((fill_px, fill_qty))
 
-        cdef Instrument instrument = self.cache.instrument(order.instrument_id)
-        if instrument is None:
+        if spread_instrument is None:
             return
 
         # Generate leg fills for spread orders after normal combo fill processing
-        if instrument.is_spread():
+        if spread_instrument.is_spread():
             self._generate_spread_leg_fills(order, applied_fills, liquidity_side)
 
         if self._queue_position and order.is_closed_c():

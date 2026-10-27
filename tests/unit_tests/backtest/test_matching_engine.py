@@ -29,6 +29,8 @@ from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.engine import ExecutionEngine
 from nautilus_trader.execution.matching_core import MatchingCore
 from nautilus_trader.execution.messages import ModifyOrder
+from nautilus_trader.model.book import OrderBook
+from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import BarSpecification
 from nautilus_trader.model.data import BarType
@@ -38,6 +40,7 @@ from nautilus_trader.model.data import OrderBookDepth10
 from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import AggregationSource
 from nautilus_trader.model.enums import AggressorSide
+from nautilus_trader.model.enums import AssetClass
 from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.enums import BookAction
 from nautilus_trader.model.enums import BookType
@@ -45,6 +48,7 @@ from nautilus_trader.model.enums import InstrumentCloseType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import MarketStatusAction
 from nautilus_trader.model.enums import OmsType
+from nautilus_trader.model.enums import OptionKind
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.enums import TimeInForce
@@ -56,12 +60,17 @@ from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderModifyRejected
 from nautilus_trader.model.events import OrderRejected
 from nautilus_trader.model.events import OrderUpdated
-from nautilus_trader.model.book import OrderBook
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import StrategyId
+from nautilus_trader.model.identifiers import Symbol
+from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.identifiers import VenueOrderId
+from nautilus_trader.model.identifiers import new_generic_spread_id
 from nautilus_trader.model.instruments import CryptoPerpetual
+from nautilus_trader.model.instruments import OptionContract
+from nautilus_trader.model.instruments import OptionSpread
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import LimitOrder
@@ -725,6 +734,123 @@ class TestOrderMatchingEngine:
         assert filled_events[0].last_qty == self.instrument.make_qty(30.0), (
             f"Expected fill of 30 (fresh liquidity), was {filled_events[0].last_qty}"
         )
+
+    def test_spread_partial_fill_at_touch_expands_financial_legs(self) -> None:
+        """An at-touch carrier slice must create matching financial-leg fills."""
+        long_leg = OptionContract(
+            instrument_id=InstrumentId(Symbol("SPXW-LONG"), Venue("OPRA")),
+            raw_symbol=Symbol("SPXW-LONG"),
+            asset_class=AssetClass.INDEX,
+            currency=USD,
+            price_precision=2,
+            price_increment=Price.from_str("0.05"),
+            multiplier=Quantity.from_int(100),
+            lot_size=Quantity.from_int(1),
+            underlying="SPX",
+            option_kind=OptionKind.CALL,
+            strike_price=Price.from_str("5000.00"),
+            activation_ns=0,
+            expiration_ns=1_800_000_000_000_000_000,
+            ts_event=0,
+            ts_init=0,
+        )
+        short_leg = OptionContract(
+            instrument_id=InstrumentId(Symbol("SPXW-SHORT"), Venue("OPRA")),
+            raw_symbol=Symbol("SPXW-SHORT"),
+            asset_class=AssetClass.INDEX,
+            currency=USD,
+            price_precision=2,
+            price_increment=Price.from_str("0.05"),
+            multiplier=Quantity.from_int(100),
+            lot_size=Quantity.from_int(1),
+            underlying="SPX",
+            option_kind=OptionKind.CALL,
+            strike_price=Price.from_str("5030.00"),
+            activation_ns=0,
+            expiration_ns=1_800_000_000_000_000_000,
+            ts_event=0,
+            ts_init=0,
+        )
+        spread_id = new_generic_spread_id([(long_leg.id, 1), (short_leg.id, -1)])
+        spread = OptionSpread(
+            instrument_id=spread_id,
+            raw_symbol=spread_id.symbol,
+            asset_class=AssetClass.INDEX,
+            currency=USD,
+            price_precision=2,
+            price_increment=Price.from_str("0.05"),
+            multiplier=Quantity.from_int(100),
+            lot_size=Quantity.from_int(1),
+            underlying="SPX",
+            strategy_type="CALL_DEBIT",
+            activation_ns=0,
+            expiration_ns=1_800_000_000_000_000_000,
+            ts_event=0,
+            ts_init=0,
+        )
+        cache = TestComponentStubs.cache()
+        for instrument in (long_leg, short_leg, spread):
+            cache.add_instrument(instrument)
+        cache.add_quote_tick(
+            TestDataStubs.quote_tick(
+                instrument=long_leg,
+                bid_price=10.0,
+                ask_price=11.0,
+                bid_size=2.0,
+                ask_size=2.0,
+            ),
+        )
+        cache.add_quote_tick(
+            TestDataStubs.quote_tick(
+                instrument=short_leg,
+                bid_price=8.0,
+                ask_price=9.0,
+                bid_size=2.0,
+                ask_size=2.0,
+            ),
+        )
+        fill_model = _ExplicitMarketBookFillModel()
+        fill_model.available = 2
+        matching_engine = OrderMatchingEngine(
+            instrument=spread,
+            raw_id=0,
+            fill_model=fill_model,
+            fee_model=MakerTakerFeeModel(),
+            book_type=BookType.L1_MBP,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            reject_stop_orders=True,
+            trade_execution=False,
+            liquidity_consumption=True,
+            msgbus=self.msgbus,
+            cache=cache,
+            clock=self.clock,
+        )
+        matching_engine.process_quote_tick(
+            TestDataStubs.quote_tick(
+                instrument=spread,
+                bid_price=2.0,
+                ask_price=3.0,
+                bid_size=2.0,
+                ask_size=2.0,
+            ),
+        )
+        messages: list[Any] = []
+        self.msgbus.register("ExecEngine.process", messages.append)
+        order = TestExecStubs.limit_order(
+            instrument=spread,
+            order_side=OrderSide.BUY,
+            price=Price.from_str("3.00"),
+            quantity=Quantity.from_int(5),
+        )
+
+        matching_engine.process_order(order, self.account_id)
+
+        fills = [message for message in messages if isinstance(message, OrderFilled)]
+        assert len(fills) == 3
+        assert fills[0].instrument_id == spread.id
+        assert {fill.instrument_id for fill in fills[1:]} == {long_leg.id, short_leg.id}
+        assert {fill.last_qty for fill in fills} == {Quantity.from_int(2)}
 
     def test_l1_marketable_limit_residual_waits_for_fresh_liquidity(self) -> None:
         """
