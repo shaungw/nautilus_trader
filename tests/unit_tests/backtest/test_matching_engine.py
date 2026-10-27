@@ -737,6 +737,9 @@ class TestOrderMatchingEngine:
 
     def test_spread_partial_fill_at_touch_expands_financial_legs(self) -> None:
         """An at-touch carrier slice must create matching financial-leg fills."""
+        clock = TestClock()
+        msgbus = MessageBus(trader_id=TestIdStubs.trader_id(), clock=clock)
+        account_id = TestIdStubs.account_id()
         long_leg = OptionContract(
             instrument_id=InstrumentId(Symbol("SPXW-LONG"), Venue("OPRA")),
             raw_symbol=Symbol("SPXW-LONG"),
@@ -822,9 +825,9 @@ class TestOrderMatchingEngine:
             reject_stop_orders=True,
             trade_execution=False,
             liquidity_consumption=True,
-            msgbus=self.msgbus,
+            msgbus=msgbus,
             cache=cache,
-            clock=self.clock,
+            clock=clock,
         )
         matching_engine.process_quote_tick(
             TestDataStubs.quote_tick(
@@ -836,15 +839,17 @@ class TestOrderMatchingEngine:
             ),
         )
         messages: list[Any] = []
-        self.msgbus.register("ExecEngine.process", messages.append)
+        msgbus.register("ExecEngine.process", messages.append)
         order = TestExecStubs.limit_order(
             instrument=spread,
             order_side=OrderSide.BUY,
             price=Price.from_str("3.00"),
             quantity=Quantity.from_int(5),
         )
+        order.apply(TestEventStubs.order_submitted(order, account_id=account_id))
+        order.apply(TestEventStubs.order_accepted(order, account_id=account_id))
 
-        matching_engine.process_order(order, self.account_id)
+        matching_engine.process_order(order, account_id)
 
         fills = [message for message in messages if isinstance(message, OrderFilled)]
         assert len(fills) == 3
